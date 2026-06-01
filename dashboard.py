@@ -44,6 +44,85 @@ TIME_FILTER_OPTIONS = {
     "All Records": None,
 }
 
+# Indian NAQI PM2.5 breakpoints for AQI calculation: (C_low, C_high, I_low, I_high)
+PM25_BREAKPOINTS = [
+    (0.0,   30.0,   0,   50),
+    (31.0,  60.0,  51,  100),
+    (61.0,  90.0, 101,  200),
+    (91.0, 120.0, 201,  300),
+    (121.0, 250.0, 301, 400),
+    (251.0, 500.0, 401, 500),
+]
+
+
+def _calculate_indian_aqi(pm25_concentration: float) -> int:
+    """Compute Indian National AQI from PM2.5 using CPCB piecewise linear interpolation."""
+    c = round(pm25_concentration)
+    if c > 500:
+        return 500
+    for c_low, c_high, i_low, i_high in PM25_BREAKPOINTS:
+        if c_low <= c <= c_high:
+            aqi = ((i_high - i_low) / (c_high - c_low)) * (c - c_low) + i_low
+            return math.floor(aqi)
+    if c == 0:
+        return 0
+    return 500
+
+
+# ─── Demo Data (Fake Sensor Readings) ─────────────────────────────────────────
+# Raw table from hardware testing session — used for demonstration without
+# a live ESP32 or database.
+_DEMO_RAW = [
+    # (time_str, temp, humidity, mq135_raw, mq7_co_raw, sharp_pm25)
+    ("9:00 AM",  28.4, 55, 1120, 850,  45),
+    ("9:10 AM",  28.5, 55, 1125, 845,  60),
+    ("9:20 AM",  28.6, 54, 1118, 860,  35),
+    ("9:30 AM",  28.5, 54, 1130, 855,  50),
+    ("9:40 AM",  29.1, 58, 1850, 920, 450),
+    ("9:50 AM",  29.4, 62, 2100, 980, 1250),
+    ("10:00 AM", 29.2, 60, 1540, 890, 320),
+    ("10:10 AM", 28.9, 57, 1210, 865, 140),
+    ("10:20 AM", 28.7, 56, 1140, 850,  85),
+    ("10:30 AM", 28.6, 55, 1135, 840,  55),
+    ("10:40 AM", 28.5, 55, 1128, 842,  40),
+    ("10:50 AM", 28.8, 54, 2400, 1950, 110),
+    ("11:00 AM", 29.1, 56, 3150, 2840, 240),
+    ("11:10 AM", 29.5, 58, 3400, 3210, 410),
+    ("11:20 AM", 29.2, 55, 2200, 1850, 180),
+    ("11:30 AM", 28.8, 52, 1450, 1100,  95),
+    ("11:40 AM", 28.6, 51, 1180, 890,  65),
+    ("11:50 AM", 28.5, 52, 1130, 855,  50),
+    ("12:00 PM", 28.4, 52, 1122, 848,  35),
+]
+
+
+def get_demo_dataframe() -> pd.DataFrame:
+    """
+    Build a demo DataFrame from the hardcoded sensor table.
+    Uses today's date combined with the sample time values.
+    Maps raw sensor columns to the dashboard's expected schema.
+    """
+    today = datetime.date.today()
+    rows = []
+    for time_str, temp, humidity, gas_raw, co_raw, pm25 in _DEMO_RAW:
+        ts = datetime.datetime.combine(
+            today,
+            datetime.datetime.strptime(time_str, "%I:%M %p").time(),
+        )
+        # Convert MQ-7 raw analog to approximate ppm (simple model)
+        co_ppm = round(co_raw / 1000.0, 4)
+        aqi = _calculate_indian_aqi(pm25)
+        rows.append({
+            "timestamp": ts,
+            "co": co_ppm,
+            "gas_raw": float(gas_raw),
+            "temp": temp,
+            "humidity": humidity,
+            "pm25": float(pm25),
+            "indian_aqi": aqi,
+        })
+    return pd.DataFrame(rows)
+
 # ─── Custom CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -469,9 +548,107 @@ def render_temp_humidity_chart(df: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
+# ─── Plotly Chart: Gas Sensors (MQ-135 & MQ-7) ────────────────────────────────
+def render_gas_chart(df: pd.DataFrame) -> None:
+    """
+    Render a dual-axis Plotly line chart:
+      - Trace 1 (left Y-axis):  MQ-135 Raw Gas Analog reading
+      - Trace 2 (right Y-axis): MQ-7 CO concentration in ppm
+    """
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # MQ-135 Gas Raw trace
+    fig.add_trace(
+        go.Scatter(
+            x=df["timestamp"],
+            y=df["gas_raw"],
+            name="MQ-135 (Gas Raw)",
+            mode="lines+markers",
+            line=dict(color="#B388FF", width=2.5, shape="spline"),
+            marker=dict(size=4, color="#B388FF"),
+            fill="tozeroy",
+            fillcolor="rgba(179,136,255,0.06)",
+            hovertemplate="<b>MQ-135</b>: %{y:.0f}<br>%{x}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+
+    # MQ-7 CO ppm trace
+    fig.add_trace(
+        go.Scatter(
+            x=df["timestamp"],
+            y=df["co"],
+            name="MQ-7 CO (ppm)",
+            mode="lines+markers",
+            line=dict(color="#FF8A65", width=2.5, dash="dot", shape="spline"),
+            marker=dict(size=4, color="#FF8A65"),
+            hovertemplate="<b>CO</b>: %{y:.4f} ppm<br>%{x}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+
+    fig.update_layout(
+        title=dict(
+            text="Gas Sensor Trends (MQ-135 & MQ-7)",
+            font=dict(color="#FFFFFF", size=14, family="Inter"),
+            x=0.02,
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(255,255,255,0.02)",
+        legend=dict(
+            orientation="h",
+            y=1.12, x=0,
+            font=dict(color="rgba(255,255,255,0.6)", size=11),
+            bgcolor="rgba(0,0,0,0)",
+        ),
+        hovermode="x unified",
+        margin=dict(l=0, r=60, t=56, b=0),
+        xaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.05)",
+            tickfont=dict(color="rgba(255,255,255,0.4)", size=10),
+            linecolor="rgba(255,255,255,0.08)",
+        ),
+        yaxis=dict(
+            title="MQ-135 Raw",
+            title_font=dict(color="#B388FF", size=11),
+            tickfont=dict(color="rgba(255,255,255,0.4)", size=10),
+            gridcolor="rgba(255,255,255,0.05)",
+            rangemode="tozero",
+        ),
+        yaxis2=dict(
+            title="CO (ppm)",
+            title_font=dict(color="#FF8A65", size=11),
+            tickfont=dict(color="rgba(255,255,255,0.4)", size=10),
+            showgrid=False,
+            rangemode="tozero",
+        ),
+    )
+
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚙️ Settings")
+    st.markdown("---")
+
+    # ── Demo Mode Toggle ──────────────────────────────────────────────────
+    demo_mode = st.toggle(
+        "🎭 Demo Mode",
+        value=False,
+        help="Enable to load sample sensor data without a live ESP32 or database.",
+    )
+    if demo_mode:
+        st.markdown(
+            '<div style="background:rgba(255,165,0,0.12);border:1px solid rgba(255,165,0,0.3);'
+            'border-radius:8px;padding:8px 12px;margin:4px 0 8px 0;">'
+            '<span style="font-size:0.72rem;color:#FFA500;">'
+            '⚡ Showing <b>demo data</b> — 19 sample readings from a hardware test session.'
+            '</span></div>',
+            unsafe_allow_html=True,
+        )
+
     st.markdown("---")
 
     time_filter_label = st.selectbox(
@@ -479,6 +656,7 @@ with st.sidebar:
         options=list(TIME_FILTER_OPTIONS.keys()),
         index=0,
         help="Choose the historical range to display in the charts.",
+        disabled=demo_mode,
     )
     selected_minutes = TIME_FILTER_OPTIONS[time_filter_label]
 
@@ -526,8 +704,24 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Fetch data
-df = fetch_data(selected_minutes)
+# Fetch data — use demo DataFrame when Demo Mode is active
+if demo_mode:
+    df = get_demo_dataframe()
+else:
+    df = fetch_data(selected_minutes)
+
+# Demo mode banner
+if demo_mode:
+    st.markdown(
+        '<div style="background:linear-gradient(90deg,rgba(255,165,0,0.15),rgba(255,100,0,0.08));'
+        'border:1px solid rgba(255,165,0,0.25);border-radius:10px;padding:10px 18px;margin-bottom:12px;'
+        'display:flex;align-items:center;gap:10px;">'
+        '<span style="font-size:1.4rem;">🎭</span>'
+        '<span style="font-size:0.82rem;color:#FFA500;">'
+        '<b>Demo Mode Active</b> — Displaying 19 sample sensor readings from a hardware test session. '
+        'Toggle off in the sidebar to switch to live data.</span></div>',
+        unsafe_allow_html=True,
+    )
 
 # Live timestamp & record count
 now_str = datetime.datetime.now().strftime("%d %b %Y, %H:%M:%S IST")
@@ -535,11 +729,19 @@ record_count = len(df) if not df.empty else 0
 
 col_ts, col_rc = st.columns([3, 1])
 with col_ts:
-    st.markdown(
-        f'<div><span class="status-dot"></span>'
-        f'<span style="font-size:0.72rem;color:rgba(255,255,255,0.3);">Live &nbsp;·&nbsp; {now_str}</span></div>',
-        unsafe_allow_html=True,
-    )
+    if demo_mode:
+        st.markdown(
+            '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;'
+            'background:#FFA500;box-shadow:0 0 8px #FFA500;margin-right:6px;"></span>'
+            f'<span style="font-size:0.72rem;color:rgba(255,255,255,0.3);">Demo &nbsp;·&nbsp; {now_str}</span></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div><span class="status-dot"></span>'
+            f'<span style="font-size:0.72rem;color:rgba(255,255,255,0.3);">Live &nbsp;·&nbsp; {now_str}</span></div>',
+            unsafe_allow_html=True,
+        )
 with col_rc:
     st.markdown(
         f'<div class="timestamp-text">{record_count} records in view</div>',
@@ -563,7 +765,7 @@ if df.empty:
 else:
     latest = df.iloc[-1]
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
 
     with c1:
         render_metric_card(
@@ -574,19 +776,26 @@ else:
         )
     with c2:
         render_metric_card(
+            label="Air Quality (MQ-135)",
+            value=f"{latest['gas_raw']:.0f}",
+            unit="Raw Analog  ·  MQ-135",
+            icon="🏭",
+        )
+    with c3:
+        render_metric_card(
             label="Carbon Monoxide",
             value=f"{latest['co']:.4f}",
             unit="ppm  ·  MQ-7",
             icon="💨",
         )
-    with c3:
+    with c4:
         render_metric_card(
-            label="Raw Particulates",
+            label="Dust / PM2.5",
             value=f"{latest['pm25']:.1f}",
-            unit="µg/m³  ·  PM2.5",
+            unit="µg/m³  ·  Sharp GP2Y10",
             icon="🌫️",
         )
-    with c4:
+    with c5:
         render_aqi_card(int(latest["indian_aqi"]))
 
     # ─── Charts ───────────────────────────────────────────────────────────────
@@ -598,8 +807,9 @@ else:
             "Keep the ESP32 sending telemetry — the dashboard will update automatically."
         )
     else:
+        trend_label = "Demo Data" if demo_mode else time_filter_label
         st.markdown(
-            '<div class="section-title">Historical Trends · ' + time_filter_label + '</div>',
+            '<div class="section-title">Historical Trends · ' + trend_label + '</div>',
             unsafe_allow_html=True,
         )
 
@@ -608,6 +818,11 @@ else:
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
         render_temp_humidity_chart(df)
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+        # ─── Gas Sensors Chart (MQ-135 & MQ-7) ─────────────────────────────
+        render_gas_chart(df)
 
     # ─── Raw Data Table (collapsed) ───────────────────────────────────────────
     st.markdown("<hr>", unsafe_allow_html=True)
